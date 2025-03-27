@@ -1,0 +1,212 @@
+"""
+Project: RCV Tabulation Algorithm
+Author: David Mitrovčan Morgan
+Date: 02/01/25
+"""
+
+from collections import Counter
+import random
+from rich.console import Console
+from rich.table import Table
+
+# Function to perform RCV tabulation with tie-breaking logic and handle misplaced N/As
+def rcv_tabulation_with_tiebreak(df, choice_columns):
+    # Shift all votes to the left to fill misplaced N/As
+    def shift_votes(row):
+        row = [choice for choice in row if pd.notna(choice)]  # Remove N/As
+        return row + [None] * (len(choice_columns) - len(row))  # Pad with N/As
+
+    df[choice_columns] = df[choice_columns].apply(shift_votes, axis=1, result_type="expand")
+
+    total_votes = len(df)
+    rounds = []
+    active_candidates = set(df[choice_columns[0]].dropna().unique())
+    historical_vote_counts = {candidate: 0 for candidate in active_candidates}
+    tie_break_steps = []
+
+    while True:
+        # Count first-choice votes for active candidates
+        first_choices = df[choice_columns[0]].dropna()
+        vote_counts = Counter(first_choices)
+
+        # Filter counts to include only active candidates
+        vote_counts = {candidate: count for candidate, count in vote_counts.items() if candidate in active_candidates}
+        rounds.append(vote_counts.copy())
+
+        # Update historical vote counts
+        for candidate, count in vote_counts.items():
+            historical_vote_counts[candidate] += count
+
+        # Check for a winner by majority threshold
+        for candidate, count in vote_counts.items():
+            if count / total_votes > 0.50:
+                return {
+                    "winner": candidate,
+                    "rounds": rounds,
+                    "tie_break_steps": tie_break_steps,
+                    "message": "Winner by majority.",
+                }
+
+        # Check for plurality winner (last candidate remaining)
+        if len(active_candidates) == 1:
+            last_candidate = list(active_candidates)[0]
+            return {
+                "winner": last_candidate,
+                "rounds": rounds,
+                "tie_break_steps": tie_break_steps,
+                "message": "Winner by plurality.",
+            }
+
+        # Determine the candidate(s) with the fewest votes
+        min_votes = min(vote_counts.values())
+        candidates_to_eliminate = [candidate for candidate, count in vote_counts.items() if count == min_votes]
+
+        # Advanced tie-breaking logic
+        if len(candidates_to_eliminate) > 1:
+            step_info = {"Step": "First Tiebreaker: Sum of 2nd Preferences"}
+            # Step 1: Compare sum of 2nd preferences
+            second_preference_sums = {
+                candidate: df[choice_columns[1]].value_counts().get(candidate, 0)
+                for candidate in candidates_to_eliminate
+            }
+            step_info["Details"] = second_preference_sums
+            max_2nd = max(second_preference_sums.values())
+            tied_candidates = [c for c in candidates_to_eliminate if second_preference_sums[c] == max_2nd]
+            tie_break_steps.append(step_info)
+
+            if len(tied_candidates) > 1:
+                step_info = {"Step": "Second Tiebreaker: Sum of 3rd Preferences"}
+                # Step 2: Compare sum of 3rd preferences
+                third_preference_sums = {
+                    candidate: df[choice_columns[2]].value_counts().get(candidate, 0)
+                    for candidate in tied_candidates
+                }
+                step_info["Details"] = third_preference_sums
+                max_3rd = max(third_preference_sums.values())
+                tied_candidates = [c for c in tied_candidates if third_preference_sums[c] == max_3rd]
+                tie_break_steps.append(step_info)
+
+                if len(tied_candidates) > 1:
+                    step_info = {"Step": "Third Tiebreaker: Historical Total Votes"}
+                    # Step 3: Compare historical total votes
+                    historical_sums = {
+                        candidate: historical_vote_counts[candidate] for candidate in tied_candidates
+                    }
+                    step_info["Details"] = historical_sums
+                    max_historical = max(historical_sums.values())
+                    tied_candidates = [c for c in tied_candidates if historical_sums[c] == max_historical]
+                    tie_break_steps.append(step_info)
+
+                    if len(tied_candidates) > 1:
+                        step_info = {"Step": "Fourth Tiebreaker: Senate Vote Required"}
+                        # Step 4: Report tied candidates for Senate decision
+                        step_info["Details"] = {"Tied Candidates": tied_candidates}
+                        tie_break_steps.append(step_info)
+
+                        # Return early since no automatic elimination is possible
+                        return {
+                            "winner": None,
+                            "rounds": rounds,
+                            "tie_break_steps": tie_break_steps,
+                            "message": "Final tie requires Senate vote between remaining candidates.",
+                        }
+
+                    else:
+                        eliminated_candidate = tied_candidates[0]
+                else:
+                    eliminated_candidate = tied_candidates[0]
+            else:
+                eliminated_candidate = tied_candidates[0]
+        else:
+            eliminated_candidate = candidates_to_eliminate[0]
+
+        # Remove eliminated candidate from future rounds
+        active_candidates.remove(eliminated_candidate)
+
+        # Redistribute votes for the eliminated candidate
+        def redistribute_votes(row):
+            row = [choice if choice in active_candidates else None for choice in row]
+            row = [choice for choice in row if choice is not None]  # Remove blanks
+            return row + [None] * (len(choice_columns) - len(row))  # Fill remaining slots with None
+
+        df[choice_columns] = df[choice_columns].apply(redistribute_votes, axis=1, result_type="expand")
+
+# Function to display results in a rich-styled table
+def display_rcv_results_with_style(rcv_result, question):
+    rounds = rcv_result["rounds"]
+    winner = rcv_result["winner"]
+    tie_break_steps = rcv_result["tie_break_steps"]
+
+    # Create a rich Table
+    table = Table(title=f"Results for {question}")
+
+    # Add headers
+    table.add_column("Candidate", style="bold")
+    for i in range(len(rounds)):
+        table.add_column(f"Round {i + 1}", justify="center")
+
+    # Get all candidates
+    all_candidates = set(candidate for round_data in rounds for candidate in round_data.keys())
+
+    # Populate table rows
+    for candidate in all_candidates:
+        row = [candidate]
+        for i, round_data in enumerate(rounds):
+            if candidate in round_data:
+                votes = round_data[candidate]
+                percentage = (votes / sum(round_data.values())) * 100
+                if candidate == winner and i == len(rounds) - 1:
+                    row.append(f"[green]{votes} ({percentage:.1f}%)[/green]")
+                else:
+                    row.append(f"{votes} ({percentage:.1f}%)")
+            else:
+                row.append("[red]Defeated[/red]")
+        table.add_row(*row)
+
+    # Print the table
+    console = Console()
+    console.print(table)
+
+    # Print tie-breaking steps if any
+    if tie_break_steps:
+        console.print("\n[bold]Tie-breaking Steps:[/bold]")
+        for step in tie_break_steps:
+            console.print(f"[bold]{step['Step']}[/bold]: {step['Details']}")
+
+file_path = 'Test_1_ElectionResults.csv'
+votes_df = pd.read_csv(file_path, delimiter=';', quotechar='"')
+
+# Step 2: Standardize column names
+votes_df.columns = votes_df.columns.str.strip()
+
+# Step 3: Function to split questions into separate DataFrames based on column prefixes
+def split_questions_to_dfs(votes_df):
+    question_dfs = {}
+    
+    for col in votes_df.columns[1:]:  # Skip SubmissionId
+        if '-' in col:
+            question_name = col.split(' - ')[0].strip()
+            if question_name not in question_dfs:
+                # Identify all columns for this question
+                relevant_columns = ['SubmissionId'] + [c for c in votes_df.columns if c.startswith(question_name)]
+                # Create a DataFrame for this question
+                question_dfs[question_name] = votes_df[relevant_columns].copy()
+    
+    return question_dfs
+
+# Step 4: Split the data into question-specific DataFrames
+question_dfs = split_questions_to_dfs(votes_df)
+
+# Display the names of the created DataFrames
+print("Questions found:", question_dfs.keys())
+
+# Step 5: Call the RCV tabulation for each question and display results
+for question_name, df_question in question_dfs.items():
+    choice_columns = [col for col in df_question.columns if col != 'SubmissionId']
+
+    # Run RCV tabulation
+    rcv_result = rcv_tabulation_with_tiebreak(df_question, choice_columns)
+
+    # Display results using the styled output
+    display_rcv_results_with_style(rcv_result, question_name)
+    
